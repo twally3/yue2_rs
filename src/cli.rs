@@ -80,17 +80,6 @@ pub fn run(default_command: &str) -> Result<i32> {
         println!("{}", output.display());
         return Ok(0);
     }
-    let mut pipe = Pipeline::from_pretrained_revision(
-        model,
-        vae,
-        flags.get("--revision").map(String::as_str),
-        flags.get("--vae-revision").map(String::as_str),
-    )?;
-    if let Some(config) = flags.get("--config") {
-        pipe.generation_config =
-            crate::protocol::GenerationConfig::from_json(&json::read(config)?)?;
-    }
-    pipe.vae_core_frames = core_frames;
     let input = if let Some(path) = flags.get("--request") {
         json::read(path)?
     } else {
@@ -107,6 +96,20 @@ pub fn run(default_command: &str) -> Result<i32> {
         request.seed = seed.parse()?;
     }
     request.validate()?;
+    let generation_config = flags
+        .get("--config")
+        .map(|path| crate::protocol::GenerationConfig::from_json(&json::read(path)?))
+        .transpose()?;
+    let mut pipe = Pipeline::from_pretrained_revision(
+        model,
+        vae,
+        flags.get("--revision").map(String::as_str),
+        flags.get("--vae-revision").map(String::as_str),
+    )?;
+    if let Some(config) = generation_config {
+        pipe.generation_config = config;
+    }
+    pipe.vae_core_frames = core_frames;
     match command.as_str() {
         "plan" => {
             let plan = pipe.plan(request, None)?;

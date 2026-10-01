@@ -116,7 +116,20 @@ pub fn ids(v: &[usize]) -> Value {
     Value::Array(v.iter().copied().map(Value::from).collect())
 }
 pub fn read(path: impl AsRef<Path>) -> Result<Value> {
-    parse(&std::fs::read_to_string(path)?)
+    let path = path.as_ref();
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("Could not read JSON file {}: {error}", resolved.display()),
+        )
+    })?;
+    parse(&text)
+        .map_err(|error| invalid(format!("Invalid JSON in {}: {error}", resolved.display())))
 }
 pub fn write(path: impl AsRef<Path>, value: &Value) -> Result<()> {
     std::fs::write(path, stringify(value) + "\n")?;
