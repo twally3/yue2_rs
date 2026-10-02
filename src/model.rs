@@ -112,6 +112,12 @@ impl Attention {
             k_norm: norm(w, &format!("{name}.k_norm"), c.head_dim, c)?,
         })
     }
+    fn enable_vectors(&mut self) {
+        self.q.vector_backend = 1;
+        self.k.vector_backend = 1;
+        self.v.vector_backend = 1;
+        self.o.vector_backend = 1;
+    }
     fn qkv(&self, x: &Tensor, rotary: &Rotary, c: &Config) -> (Tensor, Tensor, Tensor) {
         let mut q = self.q.apply(x);
         let mut k = self.k.apply(x);
@@ -192,6 +198,11 @@ impl Mlp {
             )?,
         })
     }
+    fn enable_vectors(&mut self) {
+        self.gate.vector_backend = 1;
+        self.up.vector_backend = 1;
+        self.down.vector_backend = 1;
+    }
     fn apply(&self, x: &Tensor) -> Tensor {
         let mut gate = self.gate.apply(x);
         let up = self.up.apply(x);
@@ -208,6 +219,29 @@ struct Pathway {
     mlp_norm: Norm,
     mlp: Mlp,
 }
+impl Pathway {
+    fn gpu_layer(&self, kv: &Kv) -> Option<tensor::GpuLayer> {
+        Some(tensor::GpuLayer {
+            weights: [
+                self.attention.q.gpu_weight()?,
+                self.attention.k.gpu_weight()?,
+                self.attention.v.gpu_weight()?,
+                self.attention.o.gpu_weight()?,
+                self.mlp.gate.gpu_weight()?,
+                self.mlp.up.gpu_weight()?,
+                self.mlp.down.gpu_weight()?,
+            ],
+            norms: [
+                self.input_norm.gpu_values(),
+                self.attention.q_norm.gpu_values(),
+                self.attention.k_norm.gpu_values(),
+                self.mlp_norm.gpu_values(),
+            ],
+            key: kv.key.data.as_ptr(),
+            value: kv.value.data.as_ptr(),
+        })
+    }
+}
 struct Layer {
     ar: Pathway,
     nar: Pathway,
@@ -215,7 +249,7 @@ struct Layer {
 impl Layer {
     fn load(w: &Weights, i: usize, c: &Config) -> Result<Self> {
         let p = format!("model.layers.{i}");
-        Ok(Self {
+        let mut layer = Self {
             ar: Pathway {
                 input_norm: norm(w, &format!("{p}.input_layernorm"), c.hidden_size, c)?,
                 attention: Attention::load(w, &format!("{p}.self_attn"), c)?,
@@ -233,7 +267,10 @@ impl Layer {
                 mlp_norm: norm(w, &format!("{p}.nar_pre_mlp_layernorm"), c.hidden_size, c)?,
                 mlp: Mlp::load(w, &format!("{p}.nar_mlp"), c)?,
             },
-        })
+        };
+        layer.ar.attention.enable_vectors();
+        layer.ar.mlp.enable_vectors();
+        Ok(layer)
     }
 }
 pub struct Kv {
@@ -241,13 +278,16 @@ pub struct Kv {
     pub value: Tensor,
 }
 pub struct Cache {
+    id: usize,
     pub layers: Vec<Kv>,
     pub length: usize,
     pub capacity: usize,
 }
 impl Cache {
     pub fn new(c: &Config, capacity: usize) -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             layers: (0..c.num_hidden_layers)
                 .map(|_| Kv {
                     key: Tensor::zeros(0, c.num_key_value_heads * c.head_dim),
@@ -260,6 +300,11 @@ impl Cache {
     }
 }
 
+thread_local! {
+    static ATTENTION_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> = const {
+        std::cell::RefCell::new((Vec::new(), Vec::new()))
+    };
+}
 /// Query tiles preserve the full visible key set, including grouped-query heads.
 fn attention(
     q: &Tensor,
@@ -267,52 +312,82 @@ fn attention(
     v: &Tensor,
     c: &Config,
     causal_start: Option<usize>,
+    cache: Option<(usize, usize)>,
 ) -> Tensor {
+    if let Some((cache, layer)) = cache {
+        if let Some(out) = tensor::gpu_cached_attention(
+            q,
+            k,
+            v,
+            c.num_attention_heads,
+            c.num_key_value_heads,
+            c.head_dim,
+            cache,
+            layer,
+        ) {
+            return out;
+        }
+    }
+    if let Some(out) = tensor::gpu_attention(
+        q,
+        k,
+        v,
+        c.num_attention_heads,
+        c.num_key_value_heads,
+        c.head_dim,
+        causal_start,
+    ) {
+        return out;
+    }
     let mut out = Tensor::zeros(q.rows, q.cols);
     let scale = (c.head_dim as f32).sqrt().recip();
     let groups = c.num_attention_heads / c.num_key_value_heads;
-    for start in (0..q.rows).step_by(256) {
-        let rows = (q.rows - start).min(256);
-        let keys = causal_start.map_or(k.rows, |base| (base + start + rows).min(k.rows));
-        let mut scores = vec![0.; rows * keys];
-        let mut exponential = vec![0.; keys];
-        for head in 0..c.num_attention_heads {
-            let kh = head / groups;
-            let qoffset = start * q.cols + head * c.head_dim;
-            let koff = kh * c.head_dim;
-            tensor::gemm_cpu(
-                &q.data[qoffset..],
-                &k.data[koff..],
-                &mut scores,
-                rows,
-                keys,
-                c.head_dim,
-                true,
-                q.cols,
-                k.cols,
-                keys,
-                0.,
-            );
-            for r in 0..rows {
-                let row = &mut scores[r * keys..(r + 1) * keys];
-                let visible = causal_start.map_or(keys, |base| base + start + r + 1);
-                tensor::softmax_row(row, &mut exponential, visible, scale);
+    ATTENTION_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let (scores, exponential) = &mut *scratch;
+        for start in (0..q.rows).step_by(256) {
+            let rows = (q.rows - start).min(256);
+            let keys = causal_start.map_or(k.rows, |base| (base + start + rows).min(k.rows));
+            scores.resize(rows * keys, 0.);
+            exponential.resize(keys, 0.);
+            for head in 0..c.num_attention_heads {
+                let kh = head / groups;
+                let qoffset = start * q.cols + head * c.head_dim;
+                let koff = kh * c.head_dim;
+                tensor::gemm_cpu(
+                    &q.data[qoffset..],
+                    &k.data[koff..],
+                    scores,
+                    rows,
+                    keys,
+                    c.head_dim,
+                    true,
+                    q.cols,
+                    k.cols,
+                    keys,
+                    0.,
+                );
+                for r in 0..rows {
+                    let row = &mut scores[r * keys..(r + 1) * keys];
+                    let visible = causal_start.map_or(keys, |base| base + start + r + 1);
+                    tensor::softmax_row(row, exponential, visible, scale);
+                }
+                tensor::gemm_cpu(
+                    scores,
+                    &v.data[koff..],
+                    &mut out.data[qoffset..],
+                    rows,
+                    c.head_dim,
+                    keys,
+                    false,
+                    keys,
+                    v.cols,
+                    out.cols,
+                    0.,
+                );
             }
-            tensor::gemm_cpu(
-                &scores,
-                &v.data[koff..],
-                &mut out.data[qoffset..],
-                rows,
-                c.head_dim,
-                keys,
-                false,
-                keys,
-                v.cols,
-                out.cols,
-                0.,
-            );
         }
-    }
+    });
     out.rounded()
 }
 pub struct Model {
@@ -322,10 +397,17 @@ pub struct Model {
     layers: Vec<Layer>,
     final_norm: Norm,
     lm_head: Linear,
+    head_phase: std::sync::atomic::AtomicU8,
     vae2llm: Linear,
     llm2vae: Linear,
     time_in: Linear,
     time_out: Linear,
+}
+impl Drop for Model {
+    fn drop(&mut self) {
+        tensor::clear_weight_cache();
+        tensor::release_gpu_model();
+    }
 }
 impl Model {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -333,11 +415,12 @@ impl Model {
         let c = Config::read(path.join("config.json"))?;
         let w = Weights::open(path)?;
         let embedding = w.checked("model.embed_tokens.weight", &[c.vocab_size, c.hidden_size])?;
-        let lm_head = if c.tie_word_embeddings {
+        let mut lm_head = if c.tie_word_embeddings {
             Linear::new(embedding.clone(), None, true)?
         } else {
             linear(&w, "lm_head", c.vocab_size, c.hidden_size, false)?
         };
+        lm_head.vector_backend = 2;
         Ok(Self {
             latent_position: w
                 .checked("latent_pos_embed.pe", &[c.max_latent_frames, c.hidden_size])?,
@@ -358,6 +441,7 @@ impl Model {
             config: c,
             embedding,
             lm_head,
+            head_phase: std::sync::atomic::AtomicU8::new(0),
         })
     }
     fn embed(&self, ids: &[usize]) -> Result<Tensor> {
@@ -387,6 +471,17 @@ impl Model {
         Ok(self.project_phase(&x.slice(x.rows - 1, x.rows), phase))
     }
     fn project_phase(&self, x: &Tensor, phase: crate::sampling::Phase) -> Tensor {
+        let code = match phase {
+            crate::sampling::Phase::Abc => 1,
+            crate::sampling::Phase::Semantic => 2,
+        };
+        if self
+            .head_phase
+            .swap(code, std::sync::atomic::Ordering::Relaxed)
+            != code
+        {
+            self.lm_head.clear_cached();
+        }
         let (start, end, stop) = match phase {
             crate::sampling::Phase::Abc => (0, protocol::EOD, protocol::ABC_END),
             crate::sampling::Phase::Semantic => (
@@ -430,14 +525,58 @@ impl Model {
         }
         let mut x = self.embed(ids)?;
         let rotary = Rotary::new(cache.length, ids.len(), &self.config);
-        for (layer, kv) in self.layers.iter().zip(&mut cache.layers) {
+        if ids.len() == 1 && cache.length >= 255 {
+            let layers: Option<Vec<_>> = self
+                .layers
+                .iter()
+                .zip(&cache.layers)
+                .map(|(layer, kv)| layer.ar.gpu_layer(kv))
+                .collect();
+            if let Some(layers) = layers {
+                let c = &self.config;
+                if let Some((hidden, shadow)) = tensor::gpu_ar_stack(
+                    &x,
+                    &layers,
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    c.head_dim,
+                    c.intermediate_size,
+                    cache.length,
+                    cache.id,
+                    c.rms_norm_eps,
+                    &rotary.cos,
+                    &rotary.sin,
+                ) {
+                    let width = c.num_key_value_heads * c.head_dim;
+                    for (index, kv) in cache.layers.iter_mut().enumerate() {
+                        let start = index * 2 * width;
+                        kv.key.data.extend_from_slice(&shadow[start..start + width]);
+                        kv.key.rows += 1;
+                        kv.value
+                            .data
+                            .extend_from_slice(&shadow[start + width..start + 2 * width]);
+                        kv.value.rows += 1;
+                    }
+                    cache.length += 1;
+                    return Ok(self.final_norm.apply(&hidden));
+                }
+            }
+        }
+        for (index, (layer, kv)) in self.layers.iter().zip(&mut cache.layers).enumerate() {
             let p = &layer.ar;
             let (q, k, v) = p
                 .attention
                 .qkv(&p.input_norm.apply(&x), &rotary, &self.config);
             kv.key.append(&k);
             kv.value.append(&v);
-            let h = attention(&q, &kv.key, &kv.value, &self.config, Some(cache.length));
+            let h = attention(
+                &q,
+                &kv.key,
+                &kv.value,
+                &self.config,
+                Some(cache.length),
+                Some((cache.id, index)),
+            );
             x.add(&p.attention.o.apply(&h), true);
             x.add(&p.mlp.apply(&p.mlp_norm.apply(&x)), true);
         }
@@ -502,6 +641,36 @@ impl Model {
                 *v = round_bf16(round_bf16(*v + time.data[i]) + pe);
             }
         }
+        let visible = if nar_cond_end > 0 {
+            nar_cond_end.min(cache.length)
+        } else {
+            cache.length
+        };
+        let gpu_layers: Option<Vec<_>> = self
+            .layers
+            .iter()
+            .zip(&cache.layers)
+            .map(|(layer, kv)| layer.nar.gpu_layer(kv))
+            .collect();
+        if let Some(layers) = gpu_layers {
+            if let Some(hidden) = tensor::gpu_stack(
+                &x,
+                &layers,
+                c.num_attention_heads,
+                c.num_key_value_heads,
+                c.head_dim,
+                c.intermediate_size,
+                visible,
+                cache.id,
+                c.rms_norm_eps,
+                &rotary.cos,
+                &rotary.sin,
+            ) {
+                return self
+                    .llm2vae
+                    .apply(&self.final_norm.apply(&hidden).slice(1, n - 1));
+            }
+        }
         for (layer, kv) in self.layers.iter().zip(&cache.layers) {
             let p = &layer.nar;
             let (q, k, v) = p.attention.qkv(&p.input_norm.apply(&x), rotary, c);
@@ -514,7 +683,7 @@ impl Model {
             let mut value = kv.value.slice(0, visible);
             key.append(&k);
             value.append(&v);
-            let h = attention(&q, &key, &value, c, None);
+            let h = attention(&q, &key, &value, c, None, None);
             x.add(&p.attention.o.apply(&h), true);
             x.add(&p.mlp.apply(&p.mlp_norm.apply(&x)), true);
         }
@@ -528,6 +697,9 @@ impl Model {
         seed: u64,
         steps: usize,
     ) -> Result<Tensor> {
+        // Sequential AR matrices are no longer needed in the acoustic stage.
+        tensor::clear_weight_cache();
+        tensor::clear_gpu_weight_cache();
         if self.config.latent_dim != 64
             || codec.is_empty()
             || codec.iter().any(|&t| t >= protocol::CODEC_SIZE)
@@ -565,6 +737,7 @@ impl Model {
                 end - start
             );
             let (cache, _) = self.prefill(&ids, ids.len(), false)?;
+            tensor::clear_gpu_weight_cache();
             let mut state = noise.slice(start, end).rounded();
             let rotary = Rotary::new(cache.length, state.rows + 2, &self.config);
             for step in 0..steps {

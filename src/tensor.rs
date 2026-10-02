@@ -1,8 +1,10 @@
 //! Row-major FP32 compute with checkpoint-native BF16 rounding and Apple BLAS.
 use crate::{Result, checkpoint::Weight, invalid};
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ffi::{CStr, c_char},
-    sync::OnceLock,
+    sync::{Arc, Mutex, OnceLock},
 };
 unsafe extern "C" {
     fn vDSP_vsmul(
@@ -32,7 +34,92 @@ unsafe extern "C" {
     fn vDSP_maxv(a: *const f32, stride: isize, c: *mut f32, n: usize);
     fn vDSP_sve(a: *const f32, stride: isize, c: *mut f32, n: usize);
     fn yue2_metal_available() -> i32;
+    fn yue2_metal_vector_default() -> i32;
+    fn yue2_metal_vector(
+        input: *const f32,
+        raw: *const u8,
+        mapping: usize,
+        dtype: i32,
+        rounded: i32,
+        priority: i32,
+        out: *mut f32,
+        rows: usize,
+        cols: usize,
+    ) -> i32;
+    fn yue2_physical_memory() -> u64;
+    fn yue2_metal_clear_weights();
+    fn yue2_metal_release_model();
+    fn yue2_metal_linear(
+        a: *const f32,
+        weight: *const u8,
+        mapping: usize,
+        dtype: i32,
+        round: i32,
+        c: *mut f32,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> i32;
+    fn yue2_metal_ar_stack(
+        input: *const f32,
+        out: *mut f32,
+        shadow: *mut f32,
+        layers: *const GpuLayer,
+        count: usize,
+        hidden: usize,
+        heads: usize,
+        kv: usize,
+        dim: usize,
+        intermediate: usize,
+        prefix: usize,
+        cache: usize,
+        eps: f32,
+        cos: *const f32,
+        sin: *const f32,
+    ) -> i32;
+    fn yue2_metal_stack(
+        x: *const f32,
+        out: *mut f32,
+        layers: *const GpuLayer,
+        count: usize,
+        rows: usize,
+        hidden: usize,
+        heads: usize,
+        kv: usize,
+        dim: usize,
+        intermediate: usize,
+        prefix: usize,
+        cache: usize,
+        eps: f32,
+        cos: *const f32,
+        sin: *const f32,
+    ) -> i32;
+    fn yue2_metal_cached_attention(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        keys: usize,
+        heads: usize,
+        kv: usize,
+        dim: usize,
+        cache: usize,
+        layer: usize,
+    ) -> i32;
     fn yue2_metal_name() -> *const c_char;
+    fn yue2_metal_attention(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        rows: usize,
+        keys: usize,
+        heads: usize,
+        kv: usize,
+        dim: usize,
+        causal: i64,
+        scale: f32,
+    ) -> i32;
     fn yue2_metal_gemm(
         a: *const f32,
         b: *const f32,
@@ -46,6 +133,232 @@ unsafe extern "C" {
         ldc: usize,
         beta: f32,
     ) -> i32;
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GpuWeight {
+    raw: *const u8,
+    mapping: usize,
+    rows: usize,
+    cols: usize,
+    dtype: i32,
+    rounded: i32,
+}
+#[repr(C)]
+pub(crate) struct GpuLayer {
+    pub weights: [GpuWeight; 7],
+    pub norms: [*const f32; 4],
+    pub key: *const f32,
+    pub value: *const f32,
+}
+pub(crate) fn gpu_stack(
+    x: &Tensor,
+    layers: &[GpuLayer],
+    heads: usize,
+    kv: usize,
+    dim: usize,
+    intermediate: usize,
+    prefix: usize,
+    cache: usize,
+    eps: f32,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Option<Tensor> {
+    if x.rows < 64
+        || !metal_available()
+        || std::env::var("YUE2_NAR").as_deref() == Ok("cpu")
+        || std::env::var("YUE2_ATTENTION").as_deref() == Ok("cpu")
+        || !dim.is_multiple_of(32)
+        || !x.cols.is_multiple_of(16)
+        || !intermediate.is_multiple_of(16)
+    {
+        return None;
+    }
+    for width in [
+        x.cols,
+        heads.checked_mul(dim)?,
+        kv.checked_mul(dim)?,
+        intermediate,
+    ] {
+        if x.rows.checked_mul(width)? > u32::MAX as usize {
+            return None;
+        }
+    }
+    if prefix.checked_add(x.rows)? > i32::MAX as usize {
+        return None;
+    }
+    let mut out = Tensor::zeros(x.rows, x.cols);
+    let ok = unsafe {
+        yue2_metal_stack(
+            x.data.as_ptr(),
+            out.data.as_mut_ptr(),
+            layers.as_ptr(),
+            layers.len(),
+            x.rows,
+            x.cols,
+            heads,
+            kv,
+            dim,
+            intermediate,
+            prefix,
+            cache,
+            eps,
+            cos.data.as_ptr(),
+            sin.data.as_ptr(),
+        )
+    };
+    (ok != 0).then_some(out)
+}
+pub(crate) fn gpu_ar_stack(
+    x: &Tensor,
+    layers: &[GpuLayer],
+    heads: usize,
+    kv: usize,
+    dim: usize,
+    intermediate: usize,
+    prefix: usize,
+    cache: usize,
+    eps: f32,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Option<(Tensor, Vec<f32>)> {
+    if x.rows != 1
+        || !(255..4096).contains(&prefix)
+        || dim > 256
+        || !dim.is_multiple_of(32)
+        || !metal_available()
+        || !vector_backend_enabled()
+        || std::env::var("YUE2_ATTENTION").as_deref() == Ok("cpu")
+    {
+        return None;
+    }
+    let mut out = Tensor::zeros(1, x.cols);
+    let mut shadow = vec![0.; layers.len() * 2 * kv * dim];
+    let ok = unsafe {
+        yue2_metal_ar_stack(
+            x.data.as_ptr(),
+            out.data.as_mut_ptr(),
+            shadow.as_mut_ptr(),
+            layers.as_ptr(),
+            layers.len(),
+            x.cols,
+            heads,
+            kv,
+            dim,
+            intermediate,
+            prefix,
+            cache,
+            eps,
+            cos.data.as_ptr(),
+            sin.data.as_ptr(),
+        )
+    };
+    (ok != 0).then_some((out, shadow))
+}
+type WeightKey = (usize, usize, usize, bool);
+struct ConvertedWeight {
+    // Retain the mapping so an address cannot be reused for a different file.
+    _owner: Weight,
+    values: Arc<Vec<f32>>,
+}
+struct WeightCache {
+    values: HashMap<WeightKey, ConvertedWeight>,
+    bytes: usize,
+    budget: usize,
+}
+fn weight_cache() -> &'static Mutex<WeightCache> {
+    static CACHE: OnceLock<Mutex<WeightCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let physical = unsafe { yue2_physical_memory() } as usize;
+        let gib = 1usize << 30;
+        let automatic = if physical < 12 * gib {
+            physical / 4
+        } else {
+            physical.saturating_sub(2 * gib) / 2
+        }
+        .min(8 * gib);
+        let budget = std::env::var("YUE2_CPU_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.checked_mul(1 << 20))
+            .unwrap_or(automatic)
+            .min(physical.saturating_mul(2) / 3);
+        Mutex::new(WeightCache {
+            values: HashMap::new(),
+            bytes: 0,
+            budget,
+        })
+    })
+}
+pub fn clear_weight_cache() {
+    let mut cache = weight_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.values.clear();
+    cache.bytes = 0;
+}
+pub fn clear_gpu_weight_cache() {
+    if metal_available() {
+        unsafe {
+            yue2_metal_clear_weights();
+        }
+    }
+}
+pub(crate) fn release_gpu_model() {
+    if metal_available() {
+        unsafe {
+            yue2_metal_release_model();
+        }
+    }
+}
+pub fn weight_cache_bytes() -> usize {
+    weight_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bytes
+}
+fn converted_weight(
+    weight: &Weight,
+    bf16: bool,
+    begin: usize,
+    end: usize,
+) -> Option<Arc<Vec<f32>>> {
+    let (map, offset, _) = weight.cache_identity();
+    let count = end - begin;
+    let width = if weight.dtype == crate::checkpoint::DType::F32 {
+        4
+    } else {
+        2
+    };
+    let key = (map, offset + begin * width, count, bf16);
+    let mut cache = weight_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = cache.values.get(&key) {
+        return Some(value.values.clone());
+    }
+    let bytes = count.checked_mul(4)?;
+    // Keep admitted matrices rather than cycling an LRU through every layer.
+    if bytes > cache.budget.saturating_sub(cache.bytes) {
+        return None;
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).ok()?;
+    values.resize(count, 0.);
+    weight.copy_range(begin, end, &mut values);
+    if bf16 && weight.dtype != crate::checkpoint::DType::BF16 {
+        round_slice(&mut values);
+    }
+    let values = Arc::new(values);
+    cache.values.insert(
+        key,
+        ConvertedWeight {
+            _owner: weight.clone(),
+            values: values.clone(),
+        },
+    );
+    cache.bytes += bytes;
+    Some(values)
+}
+thread_local! {
+    static WEIGHT_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static ACTIVATION_SCRATCH: RefCell<(Vec<f32>, Vec<f32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 pub fn metal_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -61,6 +374,90 @@ pub fn backend_name() -> String {
     } else {
         "Accelerate CPU".into()
     }
+}
+fn vector_backend_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("YUE2_AR").as_deref() {
+        Ok("metal") => true,
+        Ok("cpu") => false,
+        _ => unsafe { yue2_metal_vector_default() != 0 },
+    })
+}
+pub(crate) fn gpu_cached_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    heads: usize,
+    kv: usize,
+    dim: usize,
+    cache: usize,
+    layer: usize,
+) -> Option<Tensor> {
+    if q.rows != 1
+        || !(256..=4096).contains(&k.rows)
+        || dim > 256
+        || !metal_available()
+        || !vector_backend_enabled()
+        || std::env::var("YUE2_ATTENTION").as_deref() == Ok("cpu")
+    {
+        return None;
+    }
+    let mut out = Tensor::zeros(1, q.cols);
+    let ok = unsafe {
+        yue2_metal_cached_attention(
+            q.data.as_ptr(),
+            k.data.as_ptr(),
+            v.data.as_ptr(),
+            out.data.as_mut_ptr(),
+            k.rows,
+            heads,
+            kv,
+            dim,
+            cache,
+            layer,
+        )
+    };
+    (ok != 0).then_some(out)
+}
+pub fn gpu_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    heads: usize,
+    kv: usize,
+    dim: usize,
+    causal: Option<usize>,
+) -> Option<Tensor> {
+    if q.rows < 64 || !metal_available() || std::env::var("YUE2_ATTENTION").as_deref() == Ok("cpu")
+    {
+        return None;
+    }
+    assert!(heads > 0 && kv > 0 && heads.is_multiple_of(kv));
+    if !dim.is_multiple_of(16) {
+        return None;
+    }
+    assert_eq!(q.cols, heads * dim);
+    assert_eq!((k.cols, v.rows, v.cols), (kv * dim, k.rows, k.cols));
+    assert_eq!(q.data.len(), q.rows * q.cols);
+    assert_eq!(k.data.len(), k.rows * k.cols);
+    assert_eq!(v.data.len(), v.rows * v.cols);
+    let mut out = Tensor::zeros(q.rows, q.cols);
+    let ok = unsafe {
+        yue2_metal_attention(
+            q.data.as_ptr(),
+            k.data.as_ptr(),
+            v.data.as_ptr(),
+            out.data.as_mut_ptr(),
+            q.rows,
+            k.rows,
+            heads,
+            kv,
+            dim,
+            causal.map_or(-1, |c| c as i64),
+            (dim as f32).sqrt().recip(),
+        )
+    };
+    (ok != 0).then_some(out)
 }
 
 #[link(name = "Accelerate", kind = "framework")]
@@ -171,19 +568,30 @@ pub fn silu(v: f32) -> f32 {
     v / (1. + (-v).exp())
 }
 pub fn silu_slice(values: &mut [f32], bf16: bool) {
-    for chunk in values.chunks_mut(i32::MAX as usize) {
-        let input: Vec<f32> = chunk.iter().map(|v| -*v).collect();
-        let mut exp = vec![0.; chunk.len()];
-        unsafe {
-            vvexpf(exp.as_mut_ptr(), input.as_ptr(), &(chunk.len() as i32));
-        }
-        for (value, e) in chunk.iter_mut().zip(exp) {
-            *value /= 1. + e;
-            if bf16 {
-                *value = round_bf16(*value);
+    ACTIVATION_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let (input, exponential) = &mut *scratch;
+        for chunk in values.chunks_mut(i32::MAX as usize) {
+            input.resize(chunk.len(), 0.);
+            exponential.resize(chunk.len(), 0.);
+            for (dst, src) in input.iter_mut().zip(chunk.iter()) {
+                *dst = -*src;
+            }
+            unsafe {
+                vvexpf(
+                    exponential.as_mut_ptr(),
+                    input.as_ptr(),
+                    &(chunk.len() as i32),
+                );
+            }
+            for (value, e) in chunk.iter_mut().zip(exponential.iter()) {
+                *value /= 1. + e;
+                if bf16 {
+                    *value = round_bf16(*value);
+                }
             }
         }
-    }
+    });
 }
 pub fn sin_slice(values: &mut [f32]) {
     for chunk in values.chunks_mut(i32::MAX as usize) {
@@ -237,6 +645,43 @@ pub fn gemm(
     beta: f32,
 ) {
     gemm_impl(a, b, c, m, n, k, transpose_b, lda, ldb, ldc, beta, true);
+}
+pub(crate) fn cached_linear_f32(
+    input: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    outputs: usize,
+    cols: usize,
+    id: usize,
+) {
+    assert_eq!(input.len(), rows * cols);
+    assert_eq!(weight.len(), outputs * cols);
+    assert!(out.len() >= rows * outputs);
+    if rows >= 32
+        && rows.saturating_mul(outputs).saturating_mul(cols) >= 32_000_000
+        && metal_available()
+    {
+        let ok = unsafe {
+            yue2_metal_linear(
+                input.as_ptr(),
+                weight.as_ptr().cast(),
+                id,
+                1,
+                0,
+                out.as_mut_ptr(),
+                rows,
+                outputs,
+                cols,
+            )
+        };
+        if ok != 0 {
+            return;
+        }
+    }
+    gemm(
+        input, weight, out, rows, outputs, cols, true, cols, cols, outputs, 0.,
+    );
 }
 pub fn gemm_cpu(
     a: &[f32],
@@ -308,6 +753,25 @@ fn gemm_impl(
             return;
         }
     }
+    if m == 1 {
+        unsafe {
+            cblas_sgemv(
+                101,
+                if transpose_b { 111 } else { 112 },
+                if transpose_b { n } else { k } as i32,
+                if transpose_b { k } else { n } as i32,
+                1.,
+                b.as_ptr(),
+                ldb as i32,
+                a.as_ptr(),
+                1,
+                beta,
+                c.as_mut_ptr(),
+                1,
+            );
+        }
+        return;
+    }
     unsafe {
         cblas_sgemm(
             101,
@@ -332,6 +796,7 @@ pub struct Linear {
     pub weight: Weight,
     pub bias: Option<Vec<f32>>,
     pub bf16: bool,
+    pub(crate) vector_backend: u8,
 }
 impl Linear {
     pub fn new(weight: Weight, bias: Option<Weight>, bf16: bool) -> Result<Self> {
@@ -345,7 +810,44 @@ impl Linear {
             weight,
             bias: bias.map(|b| b.values()),
             bf16,
+            vector_backend: 0,
         })
+    }
+    pub(crate) fn gpu_weight(&self) -> Option<GpuWeight> {
+        if self.bias.is_some() || !self.bf16 {
+            return None;
+        }
+        Some(GpuWeight {
+            raw: self.weight.raw_bytes().as_ptr(),
+            mapping: self.weight.cache_identity().0,
+            rows: self.weight.shape[0],
+            cols: self.weight.shape[1],
+            dtype: match self.weight.dtype {
+                crate::checkpoint::DType::BF16 => 0,
+                crate::checkpoint::DType::F32 => 1,
+                crate::checkpoint::DType::F16 => 2,
+            },
+            rounded: 1,
+        })
+    }
+    pub(crate) fn clear_cached(&self) {
+        let (map, offset, count) = self.weight.cache_identity();
+        let width = if self.weight.dtype == crate::checkpoint::DType::F32 {
+            4
+        } else {
+            2
+        };
+        let end = offset + count * width;
+        let mut cache = weight_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut removed = 0;
+        cache.values.retain(|key, value| {
+            let keep = key.0 != map || key.1 < offset || key.1 >= end;
+            if !keep {
+                removed += value.values.len() * 4;
+            }
+            keep
+        });
+        cache.bytes -= removed;
     }
     pub fn apply(&self, x: &Tensor) -> Tensor {
         self.apply_range(x, 0, self.weight.shape[0])
@@ -354,59 +856,160 @@ impl Linear {
         assert!(begin < end && end <= self.weight.shape[0]);
         let out = end - begin;
         let input = self.weight.shape[1];
+        assert!(
+            out <= i32::MAX as usize && input <= i32::MAX as usize && x.rows <= i32::MAX as usize
+        );
         assert_eq!(x.cols, input);
         assert_eq!(
             x.data.len(),
             x.rows.checked_mul(x.cols).expect("Tensor size overflow")
         );
         let mut y = Tensor::zeros(x.rows, out);
+        if self.vector_backend != 0
+            && x.rows == 1
+            && out.saturating_mul(input) >= 1_000_000
+            && metal_available()
+        {
+            if vector_backend_enabled() {
+                let dtype = match self.weight.dtype {
+                    crate::checkpoint::DType::BF16 => 0,
+                    crate::checkpoint::DType::F32 => 1,
+                    crate::checkpoint::DType::F16 => 2,
+                };
+                let width = if dtype == 1 { 4 } else { 2 };
+                let raw = &self.weight.raw_bytes()[begin * input * width..end * input * width];
+                let ok = unsafe {
+                    yue2_metal_vector(
+                        x.data.as_ptr(),
+                        raw.as_ptr(),
+                        self.weight.cache_identity().0,
+                        dtype,
+                        i32::from(self.bf16),
+                        self.vector_backend as i32,
+                        y.data.as_mut_ptr(),
+                        out,
+                        input,
+                    )
+                };
+                if ok != 0 {
+                    self.finish(&mut y, begin);
+                    return y;
+                }
+            }
+        }
+        if x.rows >= 32
+            && x.rows.saturating_mul(out).saturating_mul(input) >= 32_000_000
+            && metal_available()
+        {
+            let dtype = match self.weight.dtype {
+                crate::checkpoint::DType::BF16 => 0,
+                crate::checkpoint::DType::F32 => 1,
+                crate::checkpoint::DType::F16 => 2,
+            };
+            let width = if dtype == 1 { 4 } else { 2 };
+            let raw = &self.weight.raw_bytes()[begin * input * width..end * input * width];
+            let ok = unsafe {
+                yue2_metal_linear(
+                    x.data.as_ptr(),
+                    raw.as_ptr(),
+                    self.weight.cache_identity().0,
+                    dtype,
+                    i32::from(self.bf16),
+                    y.data.as_mut_ptr(),
+                    x.rows,
+                    out,
+                    input,
+                )
+            };
+            if ok != 0 {
+                self.finish(&mut y, begin);
+                return y;
+            }
+        }
+        let cached = if x.rows == 1 {
+            converted_weight(&self.weight, self.bf16, begin * input, end * input)
+        } else {
+            None
+        };
+        if let Some(ref weight) = cached {
+            unsafe {
+                cblas_sgemv(
+                    101,
+                    111,
+                    out as i32,
+                    input as i32,
+                    1.,
+                    weight.as_ptr(),
+                    input as i32,
+                    x.data.as_ptr(),
+                    1,
+                    0.,
+                    y.data.as_mut_ptr(),
+                    1,
+                );
+            }
+            self.finish(&mut y, begin);
+            return y;
+        }
         // Conversion panels bound RAM even for the 184704 x 2048 vocabulary.
         let panel = if x.rows >= 32 && metal_available() {
             1024
         } else {
             256
         };
-        for start in (0..out).step_by(panel) {
-            let end = (start + panel).min(out);
-            let mut w = vec![0.; (end - start) * input];
-            self.weight
-                .copy_range((begin + start) * input, (begin + end) * input, &mut w);
-            if self.bf16 && self.weight.dtype != crate::checkpoint::DType::BF16 {
-                round_slice(&mut w);
-            }
-            if x.rows == 1 {
-                unsafe {
-                    cblas_sgemv(
-                        101,
-                        111,
-                        (end - start) as i32,
-                        input as i32,
-                        1.,
-                        w.as_ptr(),
-                        input as i32,
-                        x.data.as_ptr(),
-                        1,
+        WEIGHT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            for start in (0..out).step_by(panel) {
+                let end = (start + panel).min(out);
+                scratch.resize((end - start) * input, 0.);
+                self.weight.copy_range(
+                    (begin + start) * input,
+                    (begin + end) * input,
+                    &mut scratch,
+                );
+                if self.bf16 && self.weight.dtype != crate::checkpoint::DType::BF16 {
+                    round_slice(&mut scratch);
+                }
+                let w = &scratch[..];
+                if x.rows == 1 {
+                    unsafe {
+                        cblas_sgemv(
+                            101,
+                            111,
+                            (end - start) as i32,
+                            input as i32,
+                            1.,
+                            w.as_ptr(),
+                            input as i32,
+                            x.data.as_ptr(),
+                            1,
+                            0.,
+                            y.data[start..].as_mut_ptr(),
+                            1,
+                        );
+                    }
+                } else {
+                    gemm(
+                        &x.data,
+                        w,
+                        &mut y.data[start..],
+                        x.rows,
+                        end - start,
+                        input,
+                        true,
+                        input,
+                        input,
+                        out,
                         0.,
-                        y.data[start..].as_mut_ptr(),
-                        1,
                     );
                 }
-            } else {
-                gemm(
-                    &x.data,
-                    &w,
-                    &mut y.data[start..],
-                    x.rows,
-                    end - start,
-                    input,
-                    true,
-                    input,
-                    input,
-                    out,
-                    0.,
-                );
             }
-        }
+        });
+        self.finish(&mut y, begin);
+        y
+    }
+    fn finish(&self, y: &mut Tensor, begin: usize) {
+        let out = y.cols;
         for row in y.data.chunks_mut(out) {
             for (i, v) in row.iter_mut().enumerate() {
                 if let Some(b) = &self.bias {
@@ -421,7 +1024,6 @@ impl Linear {
                 }
             }
         }
-        y
     }
 }
 pub struct Norm {
@@ -431,11 +1033,18 @@ pub struct Norm {
 }
 impl Norm {
     pub fn new(weight: Weight, eps: f32, bf16: bool) -> Self {
+        let mut values = weight.values();
+        if bf16 {
+            round_slice(&mut values);
+        }
         Self {
-            weight: weight.values(),
+            weight: values,
             eps,
             bf16,
         }
+    }
+    pub(crate) fn gpu_values(&self) -> *const f32 {
+        self.weight.as_ptr()
     }
     pub fn apply(&self, x: &Tensor) -> Tensor {
         let mut y = x.clone();
@@ -447,7 +1056,7 @@ impl Norm {
             let scale = if self.bf16 { round_bf16(scale) } else { scale };
             for (v, w) in row.iter_mut().zip(&self.weight) {
                 if self.bf16 {
-                    *v = round_bf16(round_bf16(*v * scale) * round_bf16(*w));
+                    *v = round_bf16(round_bf16(*v * scale) * *w);
                 } else {
                     *v *= scale * w;
                 }
@@ -463,7 +1072,7 @@ impl Norm {
             let scale = if self.bf16 { round_bf16(scale) } else { scale };
             for (v, w) in head.iter_mut().zip(&self.weight) {
                 *v = if self.bf16 {
-                    round_bf16(round_bf16(*v * scale) * round_bf16(*w))
+                    round_bf16(round_bf16(*v * scale) * *w)
                 } else {
                     *v * scale * w
                 };

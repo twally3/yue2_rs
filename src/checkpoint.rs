@@ -6,7 +6,10 @@ use std::{
     fs::File,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 /// Resolve a local export or download checkpoint data using macOS's system curl.
@@ -168,9 +171,14 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, length: usize) -> i32;
 }
+pub(crate) fn resource_id() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 struct Mapping {
     ptr: *mut c_void,
     len: usize,
+    id: usize,
 }
 // Mappings are immutable and remain alive until every tensor view has dropped.
 unsafe impl Send for Mapping {}
@@ -186,7 +194,11 @@ impl Mapping {
         if ptr as isize == -1 {
             return Err(std::io::Error::last_os_error().into());
         }
-        Ok(Self { ptr, len })
+        Ok(Self {
+            ptr,
+            len,
+            id: resource_id(),
+        })
     }
     fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr.cast(), self.len) }
@@ -218,6 +230,12 @@ pub struct Weight {
     pub dtype: DType,
 }
 impl Weight {
+    pub(crate) fn cache_identity(&self) -> (usize, usize, usize) {
+        (self.map.id, self.offset, self.len())
+    }
+    pub(crate) fn raw_bytes(&self) -> &[u8] {
+        &self.map.bytes()[self.offset..self.offset + self.len() * self.dtype.width()]
+    }
     pub fn copy_range(&self, start: usize, end: usize, out: &mut [f32]) {
         assert!(start <= end && end <= self.len() && out.len() == end - start);
         let bytes = &self.map.bytes()

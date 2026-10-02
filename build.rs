@@ -1,6 +1,7 @@
 use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=src/metal.m");
+    println!("cargo:rerun-if-changed=src/attention.metal");
     let target = env::var("TARGET").unwrap();
     if !target.contains("apple-darwin") {
         panic!("YuE2 supports macOS only");
@@ -11,6 +12,12 @@ fn main() {
         "x86_64"
     };
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let shader = std::fs::read_to_string("src/attention.metal").unwrap();
+    std::fs::write(
+        output.join("yue2_shader.inc"),
+        format!("static const char *yue2_shader = {shader:?};\n"),
+    )
+    .unwrap();
     let object = output.join("metal.o");
     let library = output.join("libyue2metal.a");
     assert!(
@@ -21,10 +28,10 @@ fn main() {
                 "-mmacosx-version-min=11.0",
                 "-O3",
                 "-fobjc-arc",
-                "-c",
-                "src/metal.m",
-                "-o"
+                "-I",
             ])
+            .arg(&output)
+            .args(["-c", "src/metal.m", "-o"])
             .arg(&object)
             .status()
             .unwrap()

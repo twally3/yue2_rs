@@ -8,6 +8,11 @@ use crate::{
 };
 use std::path::Path;
 
+struct ConvPhase {
+    taps: Vec<usize>,
+    weight: Vec<f32>,
+    id: usize,
+}
 struct Conv {
     input: usize,
     output: usize,
@@ -17,6 +22,8 @@ struct Conv {
     dilation: usize,
     transpose: bool,
     weight: Vec<f32>,
+    weight_id: usize,
+    phases: Vec<ConvPhase>,
     bias: Vec<f32>,
 }
 impl Conv {
@@ -62,6 +69,30 @@ impl Conv {
         } else {
             vec![0.; output]
         };
+        let mut phases = Vec::new();
+        if transpose {
+            for phase in 0..stride {
+                let taps: Vec<_> = (0..kernel)
+                    .filter(|&j| j % stride == (phase + padding) % stride)
+                    .collect();
+                let cols = input * taps.len();
+                let mut packed = vec![0.; output * cols];
+                for o in 0..output {
+                    for i in 0..input {
+                        for (t, &j) in taps.iter().enumerate() {
+                            packed[o * cols + i * taps.len() + t] =
+                                weight[(i * output + o) * kernel + j];
+                        }
+                    }
+                }
+                phases.push(ConvPhase {
+                    taps,
+                    weight: packed,
+                    id: crate::checkpoint::resource_id(),
+                });
+            }
+            weight = Vec::new();
+        }
         Ok(Self {
             input,
             output,
@@ -71,6 +102,8 @@ impl Conv {
             dilation,
             transpose,
             weight,
+            weight_id: crate::checkpoint::resource_id(),
+            phases,
             bias,
         })
     }
@@ -100,9 +133,11 @@ impl Conv {
         let length = self.length(x.rows);
         let cols = self.input * self.kernel;
         let mut y = Tensor::zeros(length, self.output);
-        for start in (0..length).step_by(128) {
-            let rows = (length - start).min(128);
-            let mut patch = vec![0.; rows * cols];
+        let mut patch = Vec::new();
+        for start in (0..length).step_by(512) {
+            let rows = (length - start).min(512);
+            patch.resize(rows * cols, 0.);
+            patch.fill(0.);
             for r in 0..rows {
                 for j in 0..self.kernel {
                     let pos = ((start + r) * self.stride + j * self.dilation) as isize
@@ -115,18 +150,14 @@ impl Conv {
                     }
                 }
             }
-            tensor::gemm(
+            tensor::cached_linear_f32(
                 &patch,
                 &self.weight,
                 &mut y.data[start * self.output..],
                 rows,
                 self.output,
                 cols,
-                true,
-                cols,
-                cols,
-                self.output,
-                0.,
+                self.weight_id,
             );
         }
         for row in y.data.chunks_mut(self.output) {
@@ -141,26 +172,19 @@ impl Conv {
         let length = self.length(x.rows);
         let mut y = Tensor::zeros(length, self.output);
         for phase in 0..self.stride {
-            let taps: Vec<usize> = (0..self.kernel)
-                .filter(|&j| j % self.stride == (phase + self.padding) % self.stride)
-                .collect();
+            let packed = &self.phases[phase];
+            let taps = &packed.taps;
             let cols = self.input * taps.len();
             let rows = (length.saturating_sub(phase)).div_ceil(self.stride);
             if rows == 0 {
                 continue;
             }
-            let mut weight = vec![0.; self.output * cols];
-            for o in 0..self.output {
-                for i in 0..self.input {
-                    for (t, &j) in taps.iter().enumerate() {
-                        weight[o * cols + i * taps.len() + t] =
-                            self.weight[(i * self.output + o) * self.kernel + j];
-                    }
-                }
-            }
-            for start in (0..rows).step_by(128) {
-                let count = (rows - start).min(128);
-                let mut patch = vec![0.; count * cols];
+            let mut patch = Vec::new();
+            let mut result = Vec::new();
+            for start in (0..rows).step_by(512) {
+                let count = (rows - start).min(512);
+                patch.resize(count * cols, 0.);
+                patch.fill(0.);
                 for r in 0..count {
                     let pos = (phase + (start + r) * self.stride) as i64;
                     for (t, &j) in taps.iter().enumerate() {
@@ -173,19 +197,15 @@ impl Conv {
                         }
                     }
                 }
-                let mut result = vec![0.; count * self.output];
-                tensor::gemm(
+                result.resize(count * self.output, 0.);
+                tensor::cached_linear_f32(
                     &patch,
-                    &weight,
+                    &packed.weight,
                     &mut result,
                     count,
                     self.output,
                     cols,
-                    true,
-                    cols,
-                    cols,
-                    self.output,
-                    0.,
+                    packed.id,
                 );
                 for r in 0..count {
                     let dst = y.row_mut(phase + (start + r) * self.stride);
@@ -507,6 +527,11 @@ pub struct Vae {
     pub downsampling_ratio: usize,
     pub core_frames: usize,
     pub halo_frames: usize,
+}
+impl Drop for Vae {
+    fn drop(&mut self) {
+        tensor::clear_gpu_weight_cache();
+    }
 }
 impl Vae {
     pub fn open(path: impl AsRef<Path>, decoder_only: bool) -> Result<Self> {
