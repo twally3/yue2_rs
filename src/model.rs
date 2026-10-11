@@ -283,6 +283,11 @@ pub struct Cache {
     pub length: usize,
     pub capacity: usize,
 }
+impl Drop for Cache {
+    fn drop(&mut self) {
+        tensor::release_gpu_cache(self.id);
+    }
+}
 impl Cache {
     pub fn new(c: &Config, capacity: usize) -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -542,6 +547,7 @@ impl Model {
                     c.head_dim,
                     c.intermediate_size,
                     cache.length,
+                    cache.capacity.min(c.max_position_embeddings),
                     cache.id,
                     c.rms_norm_eps,
                     &rotary.cos,

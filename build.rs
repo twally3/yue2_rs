@@ -2,6 +2,7 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=src/metal.m");
     println!("cargo:rerun-if-changed=src/attention.metal");
+    println!("cargo:rerun-if-changed=src/vae_graph.m");
     let target = env::var("TARGET").unwrap();
     if !target.contains("apple-darwin") {
         panic!("YuE2 supports macOS only");
@@ -20,6 +21,7 @@ fn main() {
     .unwrap();
     let object = output.join("metal.o");
     let library = output.join("libyue2metal.a");
+    let vae_object = output.join("vae_graph.o");
     assert!(
         Command::new("/usr/bin/clang")
             .args([
@@ -39,10 +41,29 @@ fn main() {
         "Native Metal bridge compilation failed"
     );
     assert!(
+        Command::new("/usr/bin/clang")
+            .args([
+                "-arch",
+                arch,
+                "-mmacosx-version-min=11.0",
+                "-O3",
+                "-fobjc-arc",
+                "-c",
+                "src/vae_graph.m",
+                "-o"
+            ])
+            .arg(&vae_object)
+            .status()
+            .unwrap()
+            .success(),
+        "Native VAE graph compilation failed"
+    );
+    assert!(
         Command::new("/usr/bin/ar")
             .arg("crs")
             .arg(&library)
             .arg(&object)
+            .arg(&vae_object)
             .status()
             .unwrap()
             .success(),
@@ -50,7 +71,12 @@ fn main() {
     );
     println!("cargo:rustc-link-search=native={}", output.display());
     println!("cargo:rustc-link-lib=static=yue2metal");
-    for framework in ["Foundation", "Metal", "MetalPerformanceShaders"] {
+    for framework in [
+        "Foundation",
+        "Metal",
+        "MetalPerformanceShaders",
+        "MetalPerformanceShadersGraph",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-lib=objc");

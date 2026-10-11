@@ -15,7 +15,7 @@
 @implementation Yue2Context
 @end
 static NSMutableDictionary<NSString *, Yue2Context *> *arContexts;
-static size_t arContextBytes;
+static size_t arContextBytes, arContextBudget;
 static id<MTLDevice> device;
 static id<MTLCommandQueue> queue;
 static NSLock *lock;
@@ -42,6 +42,12 @@ static void initialize(void) {
             vectorBudget=MIN(yue2_physical_memory()/4,device.recommendedMaxWorkingSetSize*3/4);
             prefixBudget = MIN(device.hasUnifiedMemory ? yue2_physical_memory()/24
                 : device.recommendedMaxWorkingSetSize/10, (size_t)384<<20);
+            // Growing AR KV caches must not share the small acoustic-prefix
+            // budget. Bound them by system/GPU memory, retaining CPU fallback
+            // when the complete active caches do not fit.
+            arContextBudget = MIN(device.hasUnifiedMemory ? yue2_physical_memory()/16
+                : device.recommendedMaxWorkingSetSize/8, (size_t)3<<30);
+            arContextBudget = MIN(arContextBudget,device.recommendedMaxWorkingSetSize/4);
             size_t automatic = device.hasUnifiedMemory
                 ? MIN(yue2_physical_memory()/12, (size_t)2<<30)
                 : MIN(device.recommendedMaxWorkingSetSize/5, (size_t)768<<20);
@@ -74,6 +80,26 @@ void yue2_metal_release_model(void) {
     [weights removeAllObjects];weightBytes=0;[prefixes removeAllObjects];prefixBytes=0;[vectors removeAllObjects];vectorBytes=0;vectorMode=NO;[arContexts removeAllObjects];arContextBytes=0;
     for (size_t slot=19;slot<52;++slot) buffers[slot]=nil;
     [lock unlock];
+}
+void yue2_metal_release_cache(size_t cache) {
+    initialize();if (!queue) return;
+    @autoreleasepool {
+        [lock lock];
+        NSString *prefix=[NSString stringWithFormat:@"%zu/",cache];
+        for (NSString *name in arContexts.allKeys) {
+            if ([name hasPrefix:prefix]) {
+                arContextBytes-=arContexts[name].data.length;
+                [arContexts removeObjectForKey:name];
+            }
+        }
+        for (NSString *name in prefixes.allKeys) {
+            if ([name hasPrefix:prefix]) {
+                prefixBytes-=prefixes[name].length;
+                [prefixes removeObjectForKey:name];
+            }
+        }
+        [lock unlock];
+    }
 }
 static MTLResourceOptions hostStorage(void) {
     return device.hasUnifiedMemory ? MTLResourceStorageModeShared : MTLResourceStorageModeManaged;
@@ -154,7 +180,7 @@ int yue2_metal_gemm(const float *a,const float *b,float *c,
         [lock unlock]; return ok;
     }
 }
-static id<MTLComputePipelineState> packQ,packKV,softmax,unpack,rms,rotary,point,merge,weightConvert,weightVector,cachedAttention,appendContext;
+static id<MTLComputePipelineState> packQ,packKV,softmax,unpack,rms,rotary,point,merge,weightConvert,weightVector,cachedAttention,cachedAttentionParts,cachedAttentionMerge,appendContext;
 static BOOL attentionInitialize(void);
 static void dispatch(id<MTLComputeCommandEncoder> encoder,id<MTLComputePipelineState> pipeline,size_t count);
 typedef struct { uint32_t rows,cols,stride,dtype,bf16; } WeightShape;
@@ -233,6 +259,8 @@ static BOOL attentionInitialize(void) {
             weightConvert=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"convert_weight"] error:&error];
             weightVector=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"weight_vector"] error:&error];
             cachedAttention=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"cached_attention"] error:&error];
+            cachedAttentionParts=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"cached_attention_parts"] error:&error];
+            cachedAttentionMerge=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"cached_attention_merge"] error:&error];
             appendContext=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"append_context"] error:&error];
         }
         if (!packQ||!packKV||!softmax||!unpack)
@@ -575,6 +603,33 @@ int yue2_metal_vector(const float *input,const uint8_t *raw,size_t mapping,int d
 }
 
 typedef struct { uint32_t keys,capacity,heads,kv,dim,groups;float scale; } CachedAttentionShape;
+static BOOL encodeCachedAttention(id<MTLCommandBuffer> command,id<MTLBuffer> query,
+    id<MTLBuffer> context,id<MTLBuffer> output,CachedAttentionShape shape) {
+    BOOL split=shape.keys>4096;
+    if ((split && (!cachedAttentionParts||!cachedAttentionMerge)) || (!split&&!cachedAttention)) return NO;
+    size_t parts=(shape.keys+1023)/1024;
+    id<MTLBuffer> partials=split ? buffer(18,shape.heads*parts*(shape.dim+2)*4,MTLResourceStorageModePrivate) : nil;
+    if (split&&!partials) return NO;
+    id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+    if (!encoder) return NO;
+    [encoder setBuffer:query offset:0 atIndex:0];[encoder setBuffer:context offset:0 atIndex:1];
+    [encoder setBuffer:split ? partials : output offset:0 atIndex:2];
+    [encoder setBytes:&shape length:sizeof(shape) atIndex:3];
+    [encoder setComputePipelineState:split ? cachedAttentionParts : cachedAttention];
+    [encoder dispatchThreadgroups:MTLSizeMake(shape.heads,split ? parts : 1,1)
+        threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [encoder endEncoding];
+    if (split) {
+        encoder=[command computeCommandEncoder];
+        if (!encoder) return NO;
+        [encoder setBuffer:partials offset:0 atIndex:0];[encoder setBuffer:output offset:0 atIndex:1];
+        [encoder setBytes:&shape length:sizeof(shape) atIndex:2];
+        [encoder setComputePipelineState:cachedAttentionMerge];
+        [encoder dispatchThreadgroups:MTLSizeMake(shape.heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [encoder endEncoding];
+    }
+    return YES;
+}
 static Yue2Context *contextEntry(const float *k,const float *v,size_t keys,
     size_t kv,size_t dim,size_t cache,size_t layer,size_t extra) {
         NSString *name=[NSString stringWithFormat:@"%zu/%zu",cache,layer];
@@ -582,7 +637,7 @@ static Yue2Context *contextEntry(const float *k,const float *v,size_t keys,
         if (!entry || entry.capacity<keys+extra || entry.length>keys) {
             size_t capacity=(keys+extra+127)&~(size_t)127,length=capacity*kv*dim*4;
             size_t previous=entry ? entry.data.length : 0;
-            if (length>prefixBudget-arContextBytes+previous) {
+            if (length>arContextBudget-arContextBytes+previous) {
                 if (entry) { [arContexts removeObjectForKey:name];arContextBytes-=previous; }
                 return nil;
             }
@@ -613,7 +668,7 @@ static Yue2Context *contextEntry(const float *k,const float *v,size_t keys,
 }
 int yue2_metal_cached_attention(const float *q,const float *k,const float *v,float *out,
     size_t keys,size_t heads,size_t kv,size_t dim,size_t cache,size_t layer) {
-    initialize();if (!queue||keys==0||keys>4096||dim==0||dim>256||kv==0||heads==0||heads%kv!=0) return 0;
+    initialize();if (!queue||keys==0||keys>24576||dim==0||dim>256||kv==0||heads==0||heads%kv!=0) return 0;
     @autoreleasepool {
         [lock lock];
         if (!attentionInitialize()||!cachedAttention) { [lock unlock];return 0; }
@@ -622,15 +677,11 @@ int yue2_metal_cached_attention(const float *q,const float *k,const float *v,flo
         MPSMatrix *query=matrix(q,1,heads*dim,heads*dim,YES,4);
         MPSMatrix *result=matrix(out,1,heads*dim,heads*dim,NO,12);
         id<MTLCommandBuffer> command=[queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder=query&&result&&command ? [command computeCommandEncoder] : nil;
-        if (!encoder) { [lock unlock];return 0; }
+        if (!query||!result||!command) { [lock unlock];return 0; }
         CachedAttentionShape shape={(uint32_t)keys,(uint32_t)entry.capacity,(uint32_t)heads,
             (uint32_t)kv,(uint32_t)dim,(uint32_t)(heads/kv),1.0f/sqrtf(dim)};
-        [encoder setBuffer:query.data offset:0 atIndex:0];[encoder setBuffer:entry.data offset:0 atIndex:1];
-        [encoder setBuffer:result.data offset:0 atIndex:2];[encoder setBytes:&shape length:sizeof(shape) atIndex:3];
-        [encoder setComputePipelineState:cachedAttention];
-        [encoder dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [encoder endEncoding];BOOL ok=finish(command,result,out,1,heads*dim,heads*dim);
+        BOOL ok=encodeCachedAttention(command,query.data,entry.data,result.data,shape)
+            &&finish(command,result,out,1,heads*dim,heads*dim);
         [lock unlock];return ok;
     }
 }
@@ -666,19 +717,23 @@ static BOOL encodeVector(id<MTLCommandBuffer> command,id<MTLBuffer> input,
 }
 int yue2_metal_ar_stack(const float *input,float *out,float *shadow,const GpuLayer *layers,
     size_t count,size_t hidden,size_t heads,size_t kv,size_t dim,size_t intermediate,
-    size_t prefix,size_t cache,float eps,const float *cosine,const float *sine) {
-    initialize();if (!queue||prefix+1>4096) return 0;
+    size_t prefix,size_t reserved,size_t cache,float eps,const float *cosine,const float *sine) {
+    initialize();if (!queue||!count||!kv||!dim||prefix>=24576||reserved<=prefix||reserved>24576) return 0;
     @autoreleasepool {
         [lock lock];
         if (!attentionInitialize()||!rms||!rotary||!point||!cachedAttention||!appendContext||!weightVector) {
             [lock unlock];return 0;
         }
-        size_t capacity=(prefix+128)&~(size_t)127,existing=0;
+        size_t existing=0;
         for (size_t index=0;index<count;++index) {
             Yue2Context *entry=arContexts[[NSString stringWithFormat:@"%zu/%zu",cache,index]];
             existing+=entry ? entry.data.length : 0;
         }
-        if (capacity*kv*dim*4*count>prefixBudget-arContextBytes+existing) { [lock unlock];return 0; }
+        // Reserve once for the request when possible. Repacking every 128
+        // tokens otherwise copies the entire growing history repeatedly.
+        size_t available=(arContextBudget-arContextBytes+existing)/(kv*dim*4*count);
+        size_t capacity=MIN((reserved+127)&~(size_t)127,available&~(size_t)127);
+        if (capacity<=prefix) { [lock unlock];return 0; }
         if (!vectorMode) { [weights removeAllObjects];weightBytes=0;vectorMode=YES; }
         size_t qwidth=heads*dim,kwidth=kv*dim;
         id<MTLBuffer> x=buffer(20,hidden*4,MTLResourceStorageModePrivate);
@@ -723,7 +778,7 @@ int yue2_metal_ar_stack(const float *input,float *out,float *shadow,const GpuLay
         for (size_t index=0;index<count&&ok;++index) {
             @autoreleasepool {
                 const GpuLayer *layer=layers+index;
-                Yue2Context *entry=contextEntry(layer->key,layer->value,prefix,kv,dim,cache,index,1);
+                Yue2Context *entry=contextEntry(layer->key,layer->value,prefix,kv,dim,cache,index,capacity-prefix);
                 if (!command) command=[queue commandBuffer];
                 if (!entry||!command) { ok=NO;break; }
                 id<MTLBuffer> w[7];NSString *names[7];BOOL admit[7];
@@ -755,16 +810,10 @@ int yue2_metal_ar_stack(const float *input,float *out,float *shadow,const GpuLay
                 [encoder setBuffer:entry.data offset:0 atIndex:2];[encoder setBuffer:saved.data offset:0 atIndex:3];
                 [encoder setBytes:&append length:sizeof(append) atIndex:4];
                 dispatch(encoder,appendContext,kwidth);[encoder endEncoding];
-                encoder=[command computeCommandEncoder];
-                if (!encoder) { ok=NO;break; }
                 CachedAttentionShape shape={(uint32_t)(prefix+1),(uint32_t)entry.capacity,(uint32_t)heads,
                     (uint32_t)kv,(uint32_t)dim,(uint32_t)(heads/kv),1.0f/sqrtf(dim)};
-                [encoder setBuffer:q offset:0 atIndex:0];[encoder setBuffer:entry.data offset:0 atIndex:1];
-                [encoder setBuffer:attended offset:0 atIndex:2];[encoder setBytes:&shape length:sizeof(shape) atIndex:3];
-                [encoder setComputePipelineState:cachedAttention];
-                [encoder dispatchThreadgroups:MTLSizeMake(heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-                [encoder endEncoding];
-                ok=encodeVector(command,attended,w[3],&layer->weights[3],projected)
+                ok=encodeCachedAttention(command,q,entry.data,attended,shape)
+                    &&encodeVector(command,attended,w[3],&layer->weights[3],projected)
                     &&encodePoint(command,x,projected,hidden,2)
                     &&encodeNorm(command,x,gamma,gammaOffset+(hidden+dim*2)*4,norm,1,hidden,eps)
                     &&encodeVector(command,norm,w[4],&layer->weights[4],gate)

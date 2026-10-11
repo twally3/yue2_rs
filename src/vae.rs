@@ -6,7 +6,45 @@ use crate::{
     json::{self, Value},
     tensor::{self, Tensor},
 };
-use std::path::Path;
+use std::{ffi::c_void, path::Path, sync::Mutex};
+
+#[repr(C)]
+#[derive(Default)]
+struct GraphNode {
+    kind: usize,
+    input: usize,
+    residual: usize,
+    channels_in: usize,
+    channels_out: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    frames: usize,
+    weight: *const f32,
+    bias: *const f32,
+    alpha: *const f32,
+    beta: *const f32,
+}
+unsafe extern "C" {
+    fn yue2_vae_graph_create(
+        nodes: *const GraphNode,
+        count: usize,
+        frames: usize,
+        channels: usize,
+    ) -> *mut c_void;
+    fn yue2_vae_graph_run(graph: *mut c_void, input: *const f32, output: *mut f32) -> i32;
+    fn yue2_vae_graph_free(graph: *mut c_void);
+}
+struct Graph(*mut c_void);
+// The retained Objective-C graph owns its constants and buffers. Every access
+// runs under Vae::graphs' mutex, including GPU execution and destruction.
+unsafe impl Send for Graph {}
+impl Drop for Graph {
+    fn drop(&mut self) {
+        unsafe { yue2_vae_graph_free(self.0) }
+    }
+}
 
 struct ConvPhase {
     taps: Vec<usize>,
@@ -91,7 +129,6 @@ impl Conv {
                     id: crate::checkpoint::resource_id(),
                 });
             }
-            weight = Vec::new();
         }
         Ok(Self {
             input,
@@ -285,6 +322,59 @@ enum Op {
     Residual(Box<Op>),
 }
 impl Op {
+    fn graph_nodes(
+        &self,
+        nodes: &mut Vec<GraphNode>,
+        input: usize,
+        frames: usize,
+        channels: usize,
+    ) -> (usize, usize, usize) {
+        let mut node = GraphNode {
+            input,
+            frames,
+            channels_in: channels,
+            channels_out: channels,
+            ..Default::default()
+        };
+        match self {
+            Self::Conv(c) => {
+                node.kind = usize::from(c.transpose);
+                node.channels_out = c.output;
+                node.kernel = c.kernel;
+                node.stride = c.stride;
+                node.padding = c.padding;
+                node.dilation = c.dilation;
+                node.frames = c.length(frames);
+                node.weight = c.weight.as_ptr();
+                node.bias = c.bias.as_ptr();
+            }
+            Self::Activation(Activation::Snake { alpha, beta }) => {
+                node.kind = 2;
+                node.alpha = alpha.as_ptr();
+                node.beta = beta.as_ptr();
+            }
+            Self::Activation(Activation::Elu) => node.kind = 3,
+            Self::Activation(Activation::Tanh) => node.kind = 4,
+            Self::Activation(Activation::Identity) => return (input, frames, channels),
+            Self::Sequence(children) => {
+                let mut value = (input, frames, channels);
+                for child in children {
+                    value = child.graph_nodes(nodes, value.0, value.1, value.2);
+                }
+                return value;
+            }
+            Self::Residual(child) => {
+                let (result, rows, cols) = child.graph_nodes(nodes, input, frames, channels);
+                assert_eq!((rows, cols), (frames, channels));
+                node.kind = 5;
+                node.input = result;
+                node.residual = input;
+            }
+        }
+        let shape = (node.frames, node.channels_out);
+        nodes.push(node);
+        (nodes.len(), shape.0, shape.1)
+    }
     fn apply(&self, mut x: Tensor) -> Tensor {
         match self {
             Self::Conv(c) => c.apply(&x),
@@ -521,6 +611,7 @@ fn network(w: &Weights, name: &str, v: &Value, decoder: bool) -> Result<Op> {
 pub struct Vae {
     decoder: Op,
     encoder: Option<Op>,
+    graphs: Mutex<Vec<(usize, Graph)>>,
     pub sample_rate: usize,
     pub latent_dim: usize,
     pub audio_channels: usize,
@@ -534,6 +625,13 @@ impl Drop for Vae {
     }
 }
 impl Vae {
+    pub fn backend_name(&self) -> &'static str {
+        if tensor::metal_available() {
+            "Metal MPSGraph FP32"
+        } else {
+            "eager FP32 convolution"
+        }
+    }
     pub fn open(path: impl AsRef<Path>, decoder_only: bool) -> Result<Self> {
         let path = path.as_ref();
         let v = json::read(path.join("config.json"))?;
@@ -555,6 +653,7 @@ impl Vae {
         }
         Ok(Self {
             decoder: network(&w, "decoder", decoder_config, true)?,
+            graphs: Mutex::new(Vec::new()),
             encoder: if decoder_only {
                 None
             } else {
@@ -588,7 +687,40 @@ impl Vae {
     }
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         self.validate_latent(z)?;
-        let out = self.decoder.apply(z.clone());
+        let out = if tensor::metal_available() {
+            let mut graphs = self.graphs.lock().unwrap_or_else(|e| e.into_inner());
+            if !graphs.iter().any(|(frames, _)| *frames == z.rows) {
+                let mut nodes = Vec::new();
+                let (_, frames, channels) = self.decoder.graph_nodes(&mut nodes, 0, z.rows, z.cols);
+                assert_eq!(
+                    (frames, channels),
+                    (self.decoder.length(z.rows), self.audio_channels)
+                );
+                let handle =
+                    unsafe { yue2_vae_graph_create(nodes.as_ptr(), nodes.len(), z.rows, z.cols) };
+                if handle.is_null() {
+                    return Err(invalid("Could not construct the native FP32 VAE graph"));
+                }
+                // Tiling normally uses only the first, middle and last shapes.
+                // Bound cached graphs for callers decoding many arbitrary lengths.
+                if graphs.len() == 4 {
+                    graphs.remove(0);
+                }
+                graphs.push((z.rows, Graph(handle)));
+            }
+            let graph = &graphs
+                .iter()
+                .find(|(frames, _)| *frames == z.rows)
+                .unwrap()
+                .1;
+            let mut out = Tensor::zeros(self.decoder.length(z.rows), self.audio_channels);
+            if unsafe { yue2_vae_graph_run(graph.0, z.data.as_ptr(), out.data.as_mut_ptr()) } == 0 {
+                return Err(invalid("Native FP32 VAE graph execution failed"));
+            }
+            out
+        } else {
+            self.decoder.apply(z.clone())
+        };
         if !out.finite() {
             return Err(invalid("VAE produced nonfinite audio"));
         }
@@ -668,5 +800,94 @@ impl Vae {
             }
         }
         Ok(z)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Run explicitly with GPU access; absence of a device must not count as a pass.
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn metal_convolutions_match_scalar_reference() {
+        assert!(tensor::metal_available());
+        for (transpose, stride, padding, dilation, kernel) in [
+            (false, 1, 3, 1, 7),
+            (false, 1, 9, 3, 7),
+            (false, 2, 1, 1, 4),
+            (true, 2, 1, 1, 4),
+            (true, 5, 3, 1, 10),
+            (true, 6, 3, 1, 12),
+        ] {
+            let frames = 19;
+            let (ci, co) = (3, 4);
+            let x: Vec<f32> = (0..frames * ci)
+                .map(|i| ((i * 7 % 31) as f32 - 15.) * 0.03)
+                .collect();
+            let w: Vec<f32> = (0..ci * co * kernel)
+                .map(|i| ((i * 13 % 37) as f32 - 18.) * 0.01)
+                .collect();
+            let bias = [0.1, -0.2, 0.3, -0.4];
+            let length = if transpose {
+                (frames - 1) * stride + kernel - 2 * padding
+            } else {
+                (frames + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1
+            };
+            let node = GraphNode {
+                kind: usize::from(transpose),
+                input: 0,
+                channels_in: ci,
+                channels_out: co,
+                kernel,
+                stride,
+                padding,
+                dilation,
+                frames: length,
+                weight: w.as_ptr(),
+                bias: bias.as_ptr(),
+                ..Default::default()
+            };
+            let handle = unsafe { yue2_vae_graph_create(&node, 1, frames, ci) };
+            assert!(!handle.is_null());
+            let graph = Graph(handle);
+            let mut output = vec![0.; length * co];
+            assert_eq!(
+                unsafe { yue2_vae_graph_run(graph.0, x.as_ptr(), output.as_mut_ptr()) },
+                1
+            );
+            for t in 0..length {
+                for o in 0..co {
+                    let mut expected = bias[o];
+                    for i in 0..ci {
+                        for k in 0..kernel {
+                            let source = if transpose {
+                                let pos = t as isize + padding as isize - (k * dilation) as isize;
+                                if pos.rem_euclid(stride as isize) != 0 {
+                                    continue;
+                                }
+                                pos.div_euclid(stride as isize)
+                            } else {
+                                (t * stride + k * dilation) as isize - padding as isize
+                            };
+                            if !(0..frames as isize).contains(&source) {
+                                continue;
+                            }
+                            let index = if transpose {
+                                (i * co + o) * kernel + k
+                            } else {
+                                (o * ci + i) * kernel + k
+                            };
+                            expected += x[source as usize * ci + i] * w[index];
+                        }
+                    }
+                    assert!(
+                        (output[t * co + o] - expected).abs() < 2e-6,
+                        "transpose={transpose}, stride={stride}, frame={t}, channel={o}: {} vs {expected}",
+                        output[t * co + o]
+                    );
+                }
+            }
+        }
     }
 }

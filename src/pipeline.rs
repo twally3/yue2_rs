@@ -406,6 +406,7 @@ impl Pipeline {
         if self.vae.is_none() {
             eprintln!("Loading stereo VAE");
             self.vae = Some(Vae::open(&self.vae_path, true)?);
+            eprintln!("VAE decoder: {}", self.vae.as_ref().unwrap().backend_name());
         }
         let vae = self.vae.as_ref().unwrap();
         let mut audio = if full {
@@ -443,6 +444,10 @@ impl Pipeline {
             ("backend", crate::tensor::backend_name().into()),
             ("model_dtype", "bfloat16".into()),
             ("vae_dtype", "float32".into()),
+            (
+                "vae_backend",
+                self.vae.as_ref().unwrap().backend_name().into(),
+            ),
             ("vae_decode", "halo_crop".into()),
             ("vae_core_frames", self.vae_core_frames.into()),
             ("vae_halo_frames", 16usize.into()),

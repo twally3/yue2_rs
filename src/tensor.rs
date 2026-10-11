@@ -1,5 +1,87 @@
 //! Row-major FP32 compute with checkpoint-native BF16 rounding and Apple BLAS.
 use crate::{Result, checkpoint::Weight, invalid};
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn cached_attention_covers_long_context_and_append() {
+        assert!(metal_available());
+        let (heads, kv) = (4, 2);
+        for dim in [64, 128, 256] {
+            for keys in [4096, 4097, 7169, 24576] {
+                let cache = crate::checkpoint::resource_id();
+                let mut key = Tensor::zeros(keys, kv * dim);
+                let mut value = key.clone();
+                for (i, (k, v)) in key.data.iter_mut().zip(&mut value.data).enumerate() {
+                    *k = round_bf16(((i * 17 % 101) as f32 - 50.) * 0.06);
+                    *v = round_bf16(((i * 31 % 137) as f32 - 68.) * 0.007);
+                }
+                let query = Tensor::from_vec(
+                    1,
+                    heads * dim,
+                    (0..heads * dim)
+                        .map(|i| round_bf16(((i * 23 % 97) as f32 - 48.) * 0.04))
+                        .collect(),
+                )
+                .unwrap();
+                for append in 0..=usize::from(keys < 24576) {
+                    if append != 0 {
+                        key.data
+                            .extend((0..kv * dim).map(|i| round_bf16(i as f32 * 0.002 - 0.3)));
+                        value
+                            .data
+                            .extend((0..kv * dim).map(|i| round_bf16(0.4 - i as f32 * 0.001)));
+                        key.rows += 1;
+                        value.rows += 1;
+                    }
+                    let actual =
+                        gpu_cached_attention(&query, &key, &value, heads, kv, dim, cache, 0)
+                            .expect("GPU attention must execute rather than skip the test");
+                    for head in 0..heads {
+                        let kh = head / (heads / kv);
+                        let scale = (dim as f32).sqrt().recip() as f64;
+                        let mut scores = Vec::with_capacity(key.rows);
+                        for row in 0..key.rows {
+                            let score: f64 = (0..dim)
+                                .map(|d| {
+                                    query.data[head * dim + d] as f64
+                                        * key.data[row * key.cols + kh * dim + d] as f64
+                                })
+                                .sum();
+                            scores.push(score * scale);
+                        }
+                        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        for score in &mut scores {
+                            *score = (*score - max).exp();
+                        }
+                        let sum: f64 = scores.iter().sum();
+                        for d in 0..dim {
+                            let expected = round_bf16(
+                                (scores
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(row, score)| {
+                                        score * value.data[row * value.cols + kh * dim + d] as f64
+                                    })
+                                    .sum::<f64>()
+                                    / sum) as f32,
+                            );
+                            let got = actual.data[head * dim + d];
+                            assert!(
+                                (got - expected).abs() <= 5e-5 + expected.abs() * 0.008,
+                                "keys={}, dim={dim}, head={head}, d={d}: {got} vs {expected}",
+                                key.rows
+                            );
+                        }
+                    }
+                }
+                release_gpu_cache(cache);
+            }
+        }
+    }
+}
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -49,6 +131,7 @@ unsafe extern "C" {
     fn yue2_physical_memory() -> u64;
     fn yue2_metal_clear_weights();
     fn yue2_metal_release_model();
+    fn yue2_metal_release_cache(cache: usize);
     fn yue2_metal_linear(
         a: *const f32,
         weight: *const u8,
@@ -72,6 +155,7 @@ unsafe extern "C" {
         dim: usize,
         intermediate: usize,
         prefix: usize,
+        capacity: usize,
         cache: usize,
         eps: f32,
         cos: *const f32,
@@ -217,13 +301,14 @@ pub(crate) fn gpu_ar_stack(
     dim: usize,
     intermediate: usize,
     prefix: usize,
+    capacity: usize,
     cache: usize,
     eps: f32,
     cos: &Tensor,
     sin: &Tensor,
 ) -> Option<(Tensor, Vec<f32>)> {
     if x.rows != 1
-        || !(255..4096).contains(&prefix)
+        || !(255..24576).contains(&prefix)
         || dim > 256
         || !dim.is_multiple_of(32)
         || !metal_available()
@@ -247,6 +332,7 @@ pub(crate) fn gpu_ar_stack(
             dim,
             intermediate,
             prefix,
+            capacity,
             cache,
             eps,
             cos.data.as_ptr(),
@@ -307,6 +393,11 @@ pub(crate) fn release_gpu_model() {
         unsafe {
             yue2_metal_release_model();
         }
+    }
+}
+pub(crate) fn release_gpu_cache(cache: usize) {
+    if metal_available() {
+        unsafe { yue2_metal_release_cache(cache) }
     }
 }
 pub fn weight_cache_bytes() -> usize {
@@ -394,7 +485,7 @@ pub(crate) fn gpu_cached_attention(
     layer: usize,
 ) -> Option<Tensor> {
     if q.rows != 1
-        || !(256..=4096).contains(&k.rows)
+        || !(256..=24576).contains(&k.rows)
         || dim > 256
         || !metal_available()
         || !vector_backend_enabled()

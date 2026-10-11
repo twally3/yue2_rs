@@ -247,6 +247,75 @@ kernel void cached_attention(device const float *query [[buffer(0)]],
     }
 }
 
+// Split long single-query attention into bounded 1024-key partitions. Each
+// partition retains its own softmax maximum, sum and unnormalised value sum;
+// a second kernel merges them with a numerically stable global softmax.
+kernel void cached_attention_parts(device const float *query [[buffer(0)]],
+                                   device const ushort *context [[buffer(1)]],
+                                   device float *partials [[buffer(2)]],
+                                   constant CachedAttentionShape &p [[buffer(3)]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float scores[1024];
+    threadgroup float reduction[256];
+    uint head=group.x, part=group.y, start=part*1024;
+    uint rows=min(1024u,p.keys-start), parts=(p.keys+1023)/1024;
+    uint base=(head/p.groups)*p.capacity*p.dim;
+    float maximum=-INFINITY;
+    for (uint row=lane;row<rows;row+=256) {
+        float sum=0;
+        for (uint d=0;d<p.dim;++d)
+            sum+=query[head*p.dim+d]*as_type<float>(uint(context[base+(start+row)*p.dim+d])<<16);
+        scores[row]=sum*p.scale;
+        maximum=max(maximum,scores[row]);
+    }
+    reduction[lane]=maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint span=128;span>0;span>>=1) {
+        if (lane<span) reduction[lane]=max(reduction[lane],reduction[lane+span]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    maximum=reduction[0];
+    float total=0;
+    for (uint row=lane;row<rows;row+=256) {
+        scores[row]=exp(scores[row]-maximum);
+        total+=scores[row];
+    }
+    reduction[lane]=total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint span=128;span>0;span>>=1) {
+        if (lane<span) reduction[lane]+=reduction[lane+span];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint output=(head*parts+part)*(p.dim+2);
+    if (lane==0) { partials[output]=maximum;partials[output+1]=reduction[0]; }
+    if (lane<p.dim) {
+        uint value_base=p.kv*p.capacity*p.dim+base+lane;
+        float sum=0;
+        for (uint row=0;row<rows;++row)
+            sum+=scores[row]*as_type<float>(uint(context[value_base+(start+row)*p.dim])<<16);
+        partials[output+2+lane]=sum;
+    }
+}
+kernel void cached_attention_merge(device const float *partials [[buffer(0)]],
+                                   device float *output [[buffer(1)]],
+                                   constant CachedAttentionShape &p [[buffer(2)]],
+                                   uint head [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_threadgroup]]) {
+    if (lane>=p.dim) return;
+    uint parts=(p.keys+1023)/1024, stride=p.dim+2, base=head*parts*stride;
+    float maximum=-INFINITY;
+    for (uint part=0;part<parts;++part) maximum=max(maximum,partials[base+part*stride]);
+    float total=0,sum=0;
+    for (uint part=0;part<parts;++part) {
+        uint at=base+part*stride;
+        float weight=exp(partials[at]-maximum);
+        total+=weight*partials[at+1];
+        sum+=weight*partials[at+2+lane];
+    }
+    output[head*p.dim+lane]=rounded(sum/total);
+}
+
 struct AppendShape { uint position, capacity, kv, dim, layer; };
 kernel void append_context(device const float *key [[buffer(0)]],
                            device const float *value [[buffer(1)]],
