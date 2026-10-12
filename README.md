@@ -47,6 +47,8 @@ The VAE graph cache is bounded to four tile shapes per decoder and releases with
 
 Single-token Metal attention supports the model's full 24,576-token context using bounded softmax partitions beyond 4,096 keys. Growing autoregressive KV caches have a separate memory budget (at most 3 GiB, further bounded by physical and recommended GPU memory), reserve request capacity when it fits, and release when their Rust cache drops. Smaller-memory devices retain the fallback when active caches cannot fit; visible context is never shortened.
 
-Scope is the YuE2 model and its generation examples. The separate SheetSage2 and MERT transcription models, agent skill scripts, evaluation tooling, and CUDA serving backends are outside this port.
+The [YuE2 Music for Rust skill](skills/yue2-music-rs/SKILL.md) guides an LLM through native generation, score editing, instrumental voice transfer, ABC covers and local listening comparisons. Build its CPU-only helpers with `cargo build --release --bins --examples`; run `cargo run --release --example music_tools -- --help` for score inspection, comparison, chord removal, instrumental conversion and listening bundles. The skill and helpers need no Python or additional Cargo dependencies. To make the skill discoverable in Codex, copy or symlink `skills/yue2-music-rs` into your local skills directory and keep the Rust checkout available.
+
+Scope is the YuE2 model, its generation examples and the native music skill. The separate SheetSage2 and MERT transcription models, evaluation model inference, and CUDA serving backends are outside this port; an externally transcribed ABC score can be rendered by the native generator.
 
 Code retains the source repository's Apache 2.0 license and the VAE component notices in `THIRD_PARTY_NOTICES.md` and `licenses/`. Checkpoint weights retain their upstream model license.

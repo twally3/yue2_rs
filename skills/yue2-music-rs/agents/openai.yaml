@@ -1,0 +1,4 @@
+interface:
+  display_name: "YuE2 Music for Rust"
+  short_description: "Create songs, edit scores and render music on macOS"
+  default_prompt: "Use $yue2-music-rs to create music with native Rust YuE2 and give me playable audio with the full prompt and retained score."
